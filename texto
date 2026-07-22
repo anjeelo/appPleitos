@@ -1,0 +1,897 @@
+import os
+import io
+from datetime import datetime
+from zipfile import ZipFile
+import tempfile
+import shutil
+
+from flask import Flask, render_template_string, request, send_file, jsonify
+import pandas as pd
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_LINE_SPACING
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+app = Flask(__name__)
+
+# Configuração
+MODELOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modelos')
+MODELO_NACIONAL = os.path.join(MODELOS_DIR, 'Modelo Carta Pleito Backbone Nacional.docx')
+MODELO_REGIONAL = os.path.join(MODELOS_DIR, 'Modelo Carta Pleito Backbone Regional.docx')
+
+MESES_PT = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+}
+
+# Template HTML Bonito
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Geração de Cartas de Pleito</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            animation: fadeInDown 0.6s ease-out;
+        }
+
+        .header-icon {
+            font-size: 48px;
+            color: white;
+            margin-bottom: 20px;
+            background: rgba(255, 255, 255, 0.2);
+            width: 100px;
+            height: 100px;
+            line-height: 100px;
+            border-radius: 50%;
+            display: inline-block;
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            color: white;
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 16px;
+            font-weight: 300;
+        }
+
+        .main-card {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            animation: fadeInUp 0.6s ease-out;
+        }
+
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 50px 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            margin-bottom: 30px;
+            position: relative;
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: linear-gradient(135deg, #e0c3fc 0%, #8ec5fc 100%);
+            transform: translateY(-2px);
+        }
+
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: linear-gradient(135deg, #e0c3fc 0%, #8ec5fc 100%);
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 64px;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+
+        .upload-text {
+            font-size: 20px;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+
+        .upload-subtext {
+            font-size: 14px;
+            color: #718096;
+            margin-bottom: 20px;
+        }
+
+        .file-info {
+            display: none;
+            background: #f7fafc;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 20px;
+            border: 2px solid #e2e8f0;
+        }
+
+        .file-info.show {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .file-name {
+            font-weight: 500;
+            color: #2d3748;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .file-size {
+            color: #718096;
+            font-size: 14px;
+        }
+
+        .remove-file {
+            background: none;
+            border: none;
+            color: #fc8181;
+            cursor: pointer;
+            font-size: 20px;
+            transition: color 0.3s ease;
+        }
+
+        .remove-file:hover {
+            color: #f56565;
+        }
+
+        .btn-submit {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .btn-submit:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-submit:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .features {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .feature-card {
+            text-align: center;
+            padding: 20px;
+            background: #f7fafc;
+            border-radius: 12px;
+            transition: transform 0.3s ease;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .feature-icon {
+            font-size: 32px;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .feature-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 5px;
+        }
+
+        .feature-desc {
+            font-size: 12px;
+            color: #718096;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .features {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+            
+            .main-card {
+                padding: 25px;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+        }
+
+        .error-message {
+            background: #fed7d7;
+            border: 1px solid #f56565;
+            color: #c53030;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+            animation: shake 0.5s;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-10px); }
+            75% { transform: translateX(10px); }
+        }
+
+        .success-message {
+            background: #c6f6d5;
+            border: 1px solid #48bb78;
+            color: #2f855a;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+        }
+
+        .success-message.show {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-icon">
+                <i class="fas fa-file-alt"></i>
+            </div>
+            <h1>Sistema de Cartas de Pleito</h1>
+            <p>Gere automaticamente cartas consolidadas e planilhas formatadas</p>
+        </div>
+
+        <div class="main-card">
+            <div class="features">
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-file-word"></i>
+                    </div>
+                    <div class="feature-title">Cartas Consolidadas</div>
+                    <div class="feature-desc">Nacional e Regional</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-table"></i>
+                    </div>
+                    <div class="feature-title">Planilha Formatada</div>
+                    <div class="feature-desc">Excel com estilo profissional</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-bolt"></i>
+                    </div>
+                    <div class="feature-title">Processamento Rápido</div>
+                    <div class="feature-desc">Download instantâneo</div>
+                </div>
+            </div>
+
+            <form id="uploadForm" enctype="multipart/form-data">
+                <div class="upload-area" id="dropZone">
+                    <div class="upload-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </div>
+                    <div class="upload-text">Arraste e solte seu arquivo Excel aqui</div>
+                    <div class="upload-subtext">ou clique para selecionar</div>
+                    <input type="file" id="fileInput" name="planilha" accept=".xlsx,.xls" style="display: none;">
+                    
+                    <div class="file-info" id="fileInfo">
+                        <div class="file-name">
+                            <i class="fas fa-file-excel" style="color: #48bb78; font-size: 24px;"></i>
+                            <span id="fileName"></span>
+                        </div>
+                        <div>
+                            <span class="file-size" id="fileSize"></span>
+                            <button type="button" class="remove-file" id="removeFile">
+                                <i class="fas fa-times-circle"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn-submit" id="submitBtn" disabled>
+                    <i class="fas fa-paper-plane"></i>
+                    Processar Arquivo
+                </button>
+            </form>
+
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p style="color: #667eea; font-weight: 500;">Processando arquivo...</p>
+                <p style="color: #a0aec0; font-size: 14px;">Isso pode levar alguns segundos</p>
+            </div>
+
+            <div class="error-message" id="errorMessage">
+                <i class="fas fa-exclamation-circle"></i>
+                <span id="errorText"></span>
+            </div>
+
+            <div class="success-message" id="successMessage">
+                <i class="fas fa-check-circle"></i>
+                <span id="successText"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const removeFile = document.getElementById('removeFile');
+        const submitBtn = document.getElementById('submitBtn');
+        const uploadForm = document.getElementById('uploadForm');
+        const loading = document.getElementById('loading');
+        const errorMessage = document.getElementById('errorMessage');
+        const errorText = document.getElementById('errorText');
+        const successMessage = document.getElementById('successMessage');
+        const successText = document.getElementById('successText');
+
+        let selectedFile = null;
+
+        // Click to upload
+        dropZone.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        // File input change
+        fileInput.addEventListener('change', (e) => {
+            handleFile(e.target.files[0]);
+        });
+
+        // Drag and drop
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            handleFile(e.dataTransfer.files[0]);
+        });
+
+        // Remove file
+        removeFile.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectedFile = null;
+            fileInput.value = '';
+            fileInfo.classList.remove('show');
+            submitBtn.disabled = true;
+        });
+
+        function handleFile(file) {
+            if (!file) return;
+
+            const validTypes = ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 
+                              'application/vnd.ms-excel'];
+            
+            if (!validTypes.includes(file.type) && !file.name.match(/\.(xlsx|xls)$/)) {
+                showError('Por favor, selecione um arquivo Excel válido (.xlsx ou .xls)');
+                return;
+            }
+
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSize.textContent = formatFileSize(file.size);
+            fileInfo.classList.add('show');
+            submitBtn.disabled = false;
+            hideMessages();
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Form submit
+        uploadForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            if (!selectedFile) {
+                showError('Por favor, selecione um arquivo primeiro');
+                return;
+            }
+
+            // Show loading
+            loading.classList.add('show');
+            submitBtn.disabled = true;
+            hideMessages();
+
+            const formData = new FormData();
+            formData.append('planilha', selectedFile);
+
+            try {
+                const response = await fetch('/processar', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'Erro ao processar arquivo');
+                }
+
+                // Download file
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                
+                const contentDisposition = response.headers.get('Content-Disposition');
+                let filename = 'cartas_pleito.zip';
+                if (contentDisposition) {
+                    const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
+                    if (filenameMatch) filename = filenameMatch[1];
+                }
+                
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+
+                showSuccess('Arquivo processado com sucesso! O download começará automaticamente.');
+                
+                // Reset form
+                setTimeout(() => {
+                    selectedFile = null;
+                    fileInput.value = '';
+                    fileInfo.classList.remove('show');
+                    submitBtn.disabled = true;
+                }, 2000);
+
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                loading.classList.remove('show');
+                submitBtn.disabled = false;
+            }
+        });
+
+        function showError(message) {
+            errorText.textContent = message;
+            errorMessage.classList.add('show');
+            successMessage.classList.remove('show');
+        }
+
+        function showSuccess(message) {
+            successText.textContent = message;
+            successMessage.classList.add('show');
+            errorMessage.classList.remove('show');
+        }
+
+        function hideMessages() {
+            errorMessage.classList.remove('show');
+            successMessage.classList.remove('show');
+        }
+    </script>
+</body>
+</html>
+'''
+
+def format_size(bytes):
+    """Formata tamanho de arquivo para exibição"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes < 1024:
+            return f"{bytes:.1f} {unit}"
+        bytes /= 1024
+
+def apply_line_spacing(paragraph):
+    paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+
+def substituir_placeholders(text, numero_ta, data_ocorrencia, regiao, tipo, data_formatada):
+    """Substitui placeholders nos documentos"""
+    if 'Nº DA OBRAS/SERVIÇOS: Nº TA' in text:
+        text = text.replace('Nº DA OBRAS/SERVIÇOS: Nº TA', f'Nº DA OBRAS/SERVIÇOS: Nº TA {numero_ta}')
+    if 'OCORRÊNCIA Nº TA' in text:
+        text = text.replace('OCORRÊNCIA Nº TA', f'OCORRÊNCIA Nº TA {numero_ta}')
+    if 'DATA DA CONSTATAÇÃO DA OCORRÊNCIA:' in text:
+        text = text.replace('DATA DA CONSTATAÇÃO DA OCORRÊNCIA:', f'DATA DA CONSTATAÇÃO DA OCORRÊNCIA: {data_ocorrencia}')
+    if tipo == 'regional':
+        if 'Em referência à TA' in text:
+            text = text.replace('Em referência à TA', f'Em referência à TA {numero_ta}')
+    else:
+        if 'Recebemos em nosso sistema a TA' in text:
+            text = text.replace('TA', f'TA {numero_ta}')
+    if 'REGIÃO:' in text:
+        partes = text.split('REGIÃO:')
+        text = f'{partes[0]}REGIÃO: {regiao}'
+    if 'Data assinatura coordenador:' in text:
+        text = text.replace('Data assinatura coordenador:', f'Data assinatura coordenador: {data_formatada}')
+    return text
+
+def add_carta_to_document(doc, template_path, numero_ta, data_ocorrencia, regiao, tipo, data_formatada, is_first=False):
+    """Adiciona uma carta ao documento consolidado"""
+    if not is_first:
+        doc.add_page_break()
+
+    modelo_doc = Document(template_path)
+
+    for element in modelo_doc.element.body:
+        tag = element.tag.split('}')[-1]
+
+        if tag == 'p':
+            paragraph = None
+            for p in modelo_doc.paragraphs:
+                if p._element is element:
+                    paragraph = p
+                    break
+            if paragraph is None:
+                continue
+
+            new_paragraph = doc.add_paragraph()
+            new_paragraph.style = paragraph.style
+
+            if len(paragraph.runs) <= 1:
+                text = substituir_placeholders(paragraph.text, numero_ta, data_ocorrencia, regiao, tipo, data_formatada)
+                new_paragraph.add_run(text)
+            else:
+                for run in paragraph.runs:
+                    run_text = substituir_placeholders(run.text, numero_ta, data_ocorrencia, regiao, tipo, data_formatada)
+                    new_run = new_paragraph.add_run(run_text)
+                    new_run.bold = run.bold
+                    new_run.italic = run.italic
+                    new_run.underline = run.underline
+
+            apply_line_spacing(new_paragraph)
+
+        elif tag == 'tbl':
+            table = None
+            for t in modelo_doc.tables:
+                if t._element is element:
+                    table = t
+                    break
+            if table is None:
+                continue
+
+            new_table = doc.add_table(rows=len(table.rows), cols=len(table.columns))
+            new_table.style = table.style
+            for i, row in enumerate(table.rows):
+                for j, cell in enumerate(row.cells):
+                    new_table.cell(i, j).text = substituir_placeholders(cell.text, numero_ta, data_ocorrencia, regiao, tipo, data_formatada)
+
+def formatar_excel(excel_path, df):
+    """Formata o Excel com estilo profissional"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Pleitos"
+
+    # Estilos
+    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    header_font = Font(name='Calibri', size=11, bold=True, color="FFFFFF")
+    
+    even_row_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    odd_row_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    
+    cell_font = Font(name='Calibri', size=10)
+    cell_alignment = Alignment(horizontal='center', vertical='center')
+    
+    thin_border = Border(
+        left=Side(style='thin', color='B4C6E7'),
+        right=Side(style='thin', color='B4C6E7'),
+        top=Side(style='thin', color='B4C6E7'),
+        bottom=Side(style='thin', color='B4C6E7')
+    )
+
+    # Cabeçalho
+    headers = list(df.columns)
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = thin_border
+
+    # Dados
+    for row_idx, row in df.iterrows():
+        fill = even_row_fill if (row_idx % 2 == 0) else odd_row_fill
+        for col_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=row_idx + 2, column=col_idx, value=value)
+            cell.font = cell_font
+            cell.alignment = cell_alignment
+            cell.border = thin_border
+            cell.fill = fill
+
+    # Ajustar largura das colunas
+    for col_idx in range(1, len(headers) + 1):
+        max_length = 0
+        column_letter = get_column_letter(col_idx)
+        
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+        
+        adjusted_width = min(max_length + 3, 50)  # máximo 50 caracteres
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    # Congelar painel
+    ws.freeze_panes = 'A2'
+
+    # Adicionar filtros
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(excel_path)
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/processar', methods=['POST'])
+def processar():
+    # Verificar se o diretório de modelos existe
+    if not os.path.exists(MODELOS_DIR):
+        return jsonify({'error': 'Diretório de modelos não encontrado'}), 500
+    
+    if not os.path.exists(MODELO_NACIONAL) or not os.path.exists(MODELO_REGIONAL):
+        return jsonify({'error': 'Modelos de carta não encontrados no servidor'}), 500
+
+    if 'planilha' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo enviado'}), 400
+
+    file = request.files['planilha']
+    if file.filename == '':
+        return jsonify({'error': 'Nome de arquivo inválido'}), 400
+
+    try:
+        # Configurações de data
+        hoje = datetime.now()
+        data_formatada = hoje.strftime("%d/%m/%Y")
+        mes_extenso = MESES_PT[hoje.month]
+        data_completa = hoje.strftime("%d-%m-%Y")
+
+        # Ler planilha
+        df = pd.read_excel(file, header=None)
+        
+        if df.empty:
+            return jsonify({'error': 'A planilha está vazia'}), 400
+
+        # Verificar estrutura mínima
+        if len(df.columns) < 4:
+            return jsonify({'error': 'A planilha deve ter pelo menos 4 colunas (Tipo, TA, Data, Local)'}), 400
+
+        # Criar diretório temporário
+        temp_dir = tempfile.mkdtemp()
+        arquivos_gerados = []
+        dados_saida = []
+
+        # Filtrar dados
+        cartas_nacionais = df[df[0].str.strip().str.lower() == 'nacional']
+        cartas_regionais = df[df[0].str.strip().str.lower() == 'regional']
+
+        # Processar cartas nacionais
+        if not cartas_nacionais.empty:
+            doc_nac = Document(MODELO_NACIONAL)
+            
+            # Limpar documento modelo
+            for element in list(doc_nac.element.body):
+                if element.tag.endswith('p') or element.tag.endswith('tbl'):
+                    doc_nac.element.body.remove(element)
+
+            first = True
+            for _, row in cartas_nacionais.iterrows():
+                try:
+                    add_carta_to_document(
+                        doc_nac, MODELO_NACIONAL,
+                        str(row[1]), str(row[2]), str(row[3]),
+                        'nacional', data_formatada, first
+                    )
+                    first = False
+                    
+                    dados_saida.append({
+                        'UF': 'MA',
+                        'TA': str(row[1]),
+                        'Pleito': 'Analisando',
+                        'Aprovador': 'Andressa Alves Vieira Boaventura',
+                        'Seguimento': 'Nacional',
+                        'Mes': mes_extenso,
+                        'Responsável': 'Orlando/Anderson',
+                        'Localidade': str(row[3]),
+                        'Observações': ''
+                    })
+                except Exception as e:
+                    return jsonify({'error': f'Erro ao processar linha nacional: {str(e)}'}), 500
+
+            output_nac = os.path.join(temp_dir, f'cartas_pleito_nacional_consolidado_{data_completa}.docx')
+            doc_nac.save(output_nac)
+            arquivos_gerados.append(output_nac)
+
+        # Processar cartas regionais
+        if not cartas_regionais.empty:
+            doc_reg = Document(MODELO_REGIONAL)
+            
+            # Limpar documento modelo
+            for element in list(doc_reg.element.body):
+                if element.tag.endswith('p') or element.tag.endswith('tbl'):
+                    doc_reg.element.body.remove(element)
+
+            first = True
+            for _, row in cartas_regionais.iterrows():
+                try:
+                    add_carta_to_document(
+                        doc_reg, MODELO_REGIONAL,
+                        str(row[1]), str(row[2]), str(row[3]),
+                        'regional', data_formatada, first
+                    )
+                    first = False
+                    
+                    dados_saida.append({
+                        'UF': 'MA',
+                        'TA': str(row[1]),
+                        'Pleito': 'Analisando',
+                        'Aprovador': 'André Luiz Ferreira de Carvalho',
+                        'Seguimento': 'Regional',
+                        'Mes': mes_extenso,
+                        'Responsável': 'Orlando/Anderson',
+                        'Localidade': str(row[3]),
+                        'Observações': ''
+                    })
+                except Exception as e:
+                    return jsonify({'error': f'Erro ao processar linha regional: {str(e)}'}), 500
+
+            output_reg = os.path.join(temp_dir, f'cartas_pleito_regional_consolidado_{data_completa}.docx')
+            doc_reg.save(output_reg)
+            arquivos_gerados.append(output_reg)
+
+        # Gerar planilha formatada
+        if dados_saida:
+            output_excel = os.path.join(temp_dir, f'CartasPleitos({data_completa}).xlsx')
+            df_saida = pd.DataFrame(dados_saida)
+            formatar_excel(output_excel, df_saida)
+            arquivos_gerados.append(output_excel)
+
+        if not arquivos_gerados:
+            return jsonify({'error': 'Nenhum dado para processar'}), 400
+
+        # Criar ZIP
+        zip_buffer = io.BytesIO()
+        with ZipFile(zip_buffer, 'w') as zipf:
+            for arquivo in arquivos_gerados:
+                zipf.write(arquivo, os.path.basename(arquivo))
+
+        zip_buffer.seek(0)
+
+        # Limpar arquivos temporários
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'cartas_pleito_{data_completa}.zip'
+        )
+
+    except Exception as e:
+        return jsonify({'error': f'Erro ao processar arquivo: {str(e)}'}), 500
+
+if __name__ == '__main__':
+    # Verificar modelos ao iniciar
+    if not os.path.exists(MODELO_NACIONAL):
+        print("AVISO: Modelo Nacional não encontrado!")
+    if not os.path.exists(MODELO_REGIONAL):
+        print("AVISO: Modelo Regional não encontrado!")
+    
+    app.run(debug=True)
