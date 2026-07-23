@@ -5,6 +5,8 @@ import shutil
 import tempfile
 from datetime import datetime
 from zipfile import ZipFile
+import zipfile
+from xml.etree import ElementTree as ET
 
 from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
 import pandas as pd
@@ -790,6 +792,170 @@ def processar():
 
 
 # =========================================================
+# Preenchimento de células preservando imagens/estilos do modelo
+# =========================================================
+# O openpyxl documenta oficialmente que abrir e salvar um .xlsx com
+# load_workbook()/save() descarta imagens e gráficos do arquivo original.
+# Para não perder as imagens e formatações do modelo de croqui, em vez de
+# reescrever o arquivo inteiro via openpyxl, editamos apenas o XML da
+# planilha ativa dentro do .zip (.xlsx é um zip) e copiamos todo o resto
+# do arquivo (imagens, desenhos, estilos, tema) byte a byte, sem alterar.
+
+_NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+_NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+_NS_PKG_REL = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+ET.register_namespace('', _NS_MAIN)
+
+
+def _xlsx_col_to_num(col_letters):
+    num = 0
+    for ch in col_letters:
+        num = num * 26 + (ord(ch) - ord('A') + 1)
+    return num
+
+
+def _xlsx_num_to_col(num):
+    col_letters = ''
+    n = num
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        col_letters = chr(65 + rem) + col_letters
+    return col_letters
+
+
+def _xlsx_split_ref(ref):
+    m = re.match(r'^([A-Z]+)(\d+)$', ref)
+    return m.group(1), int(m.group(2))
+
+
+def _xlsx_find_active_sheet_path(zf):
+    """Resolve qual xl/worksheets/sheetN.xml corresponde à planilha ativa do modelo."""
+    wb_xml = ET.fromstring(zf.read('xl/workbook.xml'))
+    rels_xml = ET.fromstring(zf.read('xl/_rels/workbook.xml.rels'))
+
+    active_index = 0
+    book_views = wb_xml.find(f'{{{_NS_MAIN}}}bookViews')
+    if book_views is not None:
+        view = book_views.find(f'{{{_NS_MAIN}}}workbookView')
+        if view is not None and view.get('activeTab') is not None:
+            active_index = int(view.get('activeTab'))
+
+    sheets = wb_xml.find(f'{{{_NS_MAIN}}}sheets')
+    sheet_elements = sheets.findall(f'{{{_NS_MAIN}}}sheet')
+    if active_index >= len(sheet_elements):
+        active_index = 0
+    target_rid = sheet_elements[active_index].get(f'{{{_NS_REL}}}id')
+
+    rel_map = {}
+    for rel in rels_xml.findall(f'{{{_NS_PKG_REL}}}Relationship'):
+        rel_map[rel.get('Id')] = rel.get('Target')
+
+    target = rel_map[target_rid]
+    if target.startswith('/'):
+        target = target.lstrip('/')
+    else:
+        target = 'xl/' + target
+    return target
+
+
+def _xlsx_build_merge_map(sheet_root):
+    """Mapeia cada célula de um intervalo mesclado para a célula âncora (canto superior esquerdo)."""
+    merge_map = {}
+    merge_cells_el = sheet_root.find(f'{{{_NS_MAIN}}}mergeCells')
+    if merge_cells_el is None:
+        return merge_map
+
+    for mc in merge_cells_el.findall(f'{{{_NS_MAIN}}}mergeCell'):
+        ref = mc.get('ref')
+        start, end = ref.split(':')
+        start_col, start_row = _xlsx_split_ref(start)
+        end_col, end_row = _xlsx_split_ref(end)
+        c1, c2 = _xlsx_col_to_num(start_col), _xlsx_col_to_num(end_col)
+        for r in range(start_row, end_row + 1):
+            for c in range(min(c1, c2), max(c1, c2) + 1):
+                merge_map[f'{_xlsx_num_to_col(c)}{r}'] = start
+    return merge_map
+
+
+def _xlsx_set_cell_value(sheet_root, cell_ref, value):
+    col_letters, row_num = _xlsx_split_ref(cell_ref)
+    sheet_data = sheet_root.find(f'{{{_NS_MAIN}}}sheetData')
+
+    row_el = None
+    for r in sheet_data.findall(f'{{{_NS_MAIN}}}row'):
+        if int(r.get('r')) == row_num:
+            row_el = r
+            break
+    if row_el is None:
+        row_el = ET.SubElement(sheet_data, f'{{{_NS_MAIN}}}row')
+        row_el.set('r', str(row_num))
+        rows_sorted = sorted(sheet_data.findall(f'{{{_NS_MAIN}}}row'), key=lambda x: int(x.get('r')))
+        sheet_data[:] = rows_sorted
+
+    cell_el = None
+    for c in row_el.findall(f'{{{_NS_MAIN}}}c'):
+        if c.get('r') == cell_ref:
+            cell_el = c
+            break
+    if cell_el is None:
+        cell_el = ET.SubElement(row_el, f'{{{_NS_MAIN}}}c')
+        cell_el.set('r', cell_ref)
+        cells_sorted = sorted(
+            row_el.findall(f'{{{_NS_MAIN}}}c'),
+            key=lambda c: _xlsx_col_to_num(_xlsx_split_ref(c.get('r'))[0])
+        )
+        row_el[:] = cells_sorted
+
+    # limpa o valor/fórmula antigos, mas preserva o atributo de estilo "s" da célula
+    for child in list(cell_el):
+        cell_el.remove(child)
+
+    if isinstance(value, bool):
+        cell_el.set('t', 'b')
+        v_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}v')
+        v_el.text = '1' if value else '0'
+    elif isinstance(value, (int, float)):
+        cell_el.attrib.pop('t', None)
+        v_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}v')
+        v_el.text = repr(value) if isinstance(value, float) else str(value)
+    else:
+        cell_el.set('t', 'inlineStr')
+        is_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}is')
+        t_el = ET.SubElement(is_el, f'{{{_NS_MAIN}}}t')
+        t_el.text = '' if value is None else str(value)
+        t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+
+
+def preencher_modelo_xlsx(modelo_path, valores, output_path):
+    """
+    Preenche células de um .xlsx a partir de {celula: valor}, editando
+    apenas o XML da planilha ativa. Imagens, desenhos, estilos e gráficos
+    do modelo são copiados sem alteração — não passam pelo openpyxl.
+    """
+    with zipfile.ZipFile(modelo_path, 'r') as zin:
+        sheet_path = _xlsx_find_active_sheet_path(zin)
+        sheet_root = ET.fromstring(zin.read(sheet_path))
+
+        merge_map = _xlsx_build_merge_map(sheet_root)
+
+        for cell_ref, value in valores.items():
+            if value is None:
+                continue
+            actual_ref = merge_map.get(cell_ref, cell_ref)
+            _xlsx_set_cell_value(sheet_root, actual_ref, value)
+
+        new_sheet_bytes = ET.tostring(sheet_root, encoding='UTF-8', xml_declaration=True)
+
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == sheet_path:
+                    zout.writestr(item, new_sheet_bytes)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+
+
+# =========================================================
 # Helpers - Criação de Croqui
 # =========================================================
 def sanitize_filename(filename):
@@ -835,33 +1001,21 @@ def processar_croqui():
             if not row_has_data:
                 continue
 
-            wb_copy = openpyxl.load_workbook(MODELO_CROQUI)
-            ws_copy = wb_copy.active
-
+            valores = {}
             for col_offset, celula_destino in CROQUI_MAPPINGS:
                 col_origem = col_offset + 1
                 value = ws_input.cell(row=row_idx, column=col_origem).value
-                if value is None:
-                    continue
-                try:
-                    cell = ws_copy[celula_destino]
-                    for merged_range in ws_copy.merged_cells.ranges:
-                        if cell.coordinate in merged_range:
-                            cell = ws_copy.cell(row=merged_range.min_row, column=merged_range.min_col)
-                            break
-                    cell.value = value
-                except Exception:
-                    pass
+                if value is not None:
+                    valores[celula_destino] = value
 
             obra_value = ws_input.cell(row=row_idx, column=3).value
             if obra_value:
                 filename = sanitize_filename(str(obra_value))
                 if not filename.endswith('.xlsx'):
                     filename += '.xlsx'
-                wb_copy.save(os.path.join(croquis_dir, filename))
+                output_path = os.path.join(croquis_dir, filename)
+                preencher_modelo_xlsx(MODELO_CROQUI, valores, output_path)
                 generated_count += 1
-
-            wb_copy.close()
 
         wb_input.close()
 
