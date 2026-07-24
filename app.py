@@ -927,6 +927,20 @@ def _xlsx_set_cell_value(sheet_root, cell_ref, value):
         t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
 
 
+def _safe_date_time(date_time):
+    """Alguns geradores de xlsx (Excel/LibreOffice) gravam datas fora do
+    intervalo aceito pelo zipfile do Python (ano < 1980, mês/dia 0, etc.),
+    o que faz o zipfile lançar erro ao regravar a entrada. Normaliza aqui."""
+    year, month, day, hour, minute, second = date_time
+    year = max(year, 1980)
+    month = min(max(month, 1), 12)
+    day = min(max(day, 1), 31)
+    hour = min(max(hour, 0), 23)
+    minute = min(max(minute, 0), 59)
+    second = min(max(second, 0), 59)
+    return (year, month, day, hour, minute, second)
+
+
 def preencher_modelo_xlsx(modelo_path, valores, output_path):
     """
     Preenche células de um .xlsx a partir de {celula: valor}, editando
@@ -949,10 +963,30 @@ def preencher_modelo_xlsx(modelo_path, valores, output_path):
 
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
-                if item.filename == sheet_path:
-                    zout.writestr(item, new_sheet_bytes)
-                else:
-                    zout.writestr(item, zin.read(item.filename))
+                data = new_sheet_bytes if item.filename == sheet_path else zin.read(item.filename)
+
+                # Cria um ZipInfo NOVO em vez de reaproveitar o original.
+                # Reutilizar o ZipInfo de origem (com seus flag_bits, extras
+                # de zip64 e tamanhos/CRC antigos) é uma causa clássica de
+                # zip corrompido ao regravar em uma versão diferente do
+                # Python/zipfile (ex.: ambiente do Render x ambiente local).
+                fresh_info = zipfile.ZipInfo(
+                    filename=item.filename,
+                    date_time=_safe_date_time(item.date_time)
+                )
+                fresh_info.compress_type = zipfile.ZIP_DEFLATED
+                fresh_info.external_attr = item.external_attr
+                fresh_info.create_system = item.create_system
+
+                zout.writestr(fresh_info, data)
+
+        # Verifica a integridade do arquivo antes de devolvê-lo — se algo
+        # ficou corrompido, falha aqui com um erro claro em vez de gerar
+        # um .xlsx quebrado que só vai ser percebido ao abrir no Excel.
+        with zipfile.ZipFile(output_path, 'r') as check:
+            bad_file = check.testzip()
+            if bad_file is not None:
+                raise RuntimeError(f'Falha de integridade ao gerar o croqui (entrada corrompida: {bad_file})')
 
 
 # =========================================================
