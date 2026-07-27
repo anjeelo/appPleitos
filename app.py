@@ -6,7 +6,6 @@ import tempfile
 from datetime import datetime
 from zipfile import ZipFile
 import zipfile
-from xml.etree import ElementTree as ET
 
 from flask import Flask, render_template_string, request, send_file, jsonify, redirect, url_for
 import pandas as pd
@@ -797,141 +796,178 @@ def processar():
 # =========================================================
 # O openpyxl documenta oficialmente que abrir e salvar um .xlsx com
 # load_workbook()/save() descarta imagens e gráficos do arquivo original.
-# Para não perder as imagens e formatações do modelo de croqui, em vez de
-# reescrever o arquivo inteiro via openpyxl, editamos apenas o XML da
-# planilha ativa dentro do .zip (.xlsx é um zip) e copiamos todo o resto
-# do arquivo (imagens, desenhos, estilos, tema) byte a byte, sem alterar.
+# Além disso, reescrever o XML inteiro com parsers genéricos (ElementTree
+# incluído) troca os prefixos de namespaces estendidos que o Excel real
+# usa (x14ac, xr, xr2, xr3, mc:Ignorable), o que faz o Excel acusar
+# "conteúdo com problema" ao reabrir o arquivo gerado.
+#
+# Por isso, em vez de fazer parse/reserialização da árvore XML inteira,
+# a função abaixo faz uma edição cirúrgica de texto: localiza a tag <c>
+# exata de cada célula-alvo dentro do XML da planilha ativa e substitui
+# só o conteúdo dela. Todo o resto do arquivo — o restante do próprio
+# XML, imagens, desenhos, estilos, namespaces estendidos — permanece
+# byte a byte idêntico ao modelo original.
 
-_NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-_NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-_NS_PKG_REL = 'http://schemas.openxmlformats.org/package/2006/relationships'
-
-ET.register_namespace('', _NS_MAIN)
-
-
-def _xlsx_col_to_num(col_letters):
+def _col_to_num(col_letters):
     num = 0
     for ch in col_letters:
         num = num * 26 + (ord(ch) - ord('A') + 1)
     return num
 
 
-def _xlsx_num_to_col(num):
-    col_letters = ''
-    n = num
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        col_letters = chr(65 + rem) + col_letters
-    return col_letters
-
-
-def _xlsx_split_ref(ref):
+def _split_ref(ref):
     m = re.match(r'^([A-Z]+)(\d+)$', ref)
     return m.group(1), int(m.group(2))
 
 
-def _xlsx_find_active_sheet_path(zf):
-    """Resolve qual xl/worksheets/sheetN.xml corresponde à planilha ativa do modelo."""
-    wb_xml = ET.fromstring(zf.read('xl/workbook.xml'))
-    rels_xml = ET.fromstring(zf.read('xl/_rels/workbook.xml.rels'))
+def _find_active_sheet_path(zf):
+    import re as _re
+    wb_xml = zf.read('xl/workbook.xml').decode('utf-8')
+    rels_xml = zf.read('xl/_rels/workbook.xml.rels').decode('utf-8')
 
     active_index = 0
-    book_views = wb_xml.find(f'{{{_NS_MAIN}}}bookViews')
-    if book_views is not None:
-        view = book_views.find(f'{{{_NS_MAIN}}}workbookView')
-        if view is not None and view.get('activeTab') is not None:
-            active_index = int(view.get('activeTab'))
+    m = _re.search(r'<workbookView[^>]*activeTab="(\d+)"', wb_xml)
+    if m:
+        active_index = int(m.group(1))
 
-    sheets = wb_xml.find(f'{{{_NS_MAIN}}}sheets')
-    sheet_elements = sheets.findall(f'{{{_NS_MAIN}}}sheet')
-    if active_index >= len(sheet_elements):
+    sheet_matches = _re.findall(r'<sheet\b[^>]*/>', wb_xml)
+    if not sheet_matches or active_index >= len(sheet_matches):
         active_index = 0
-    target_rid = sheet_elements[active_index].get(f'{{{_NS_REL}}}id')
+    target_sheet_tag = sheet_matches[active_index]
+    rid_match = _re.search(r'r:id="([^"]+)"', target_sheet_tag)
+    target_rid = rid_match.group(1)
 
     rel_map = {}
-    for rel in rels_xml.findall(f'{{{_NS_PKG_REL}}}Relationship'):
-        rel_map[rel.get('Id')] = rel.get('Target')
+    for tag in _re.findall(r'<Relationship\b[^>]*/>', rels_xml):
+        id_m = _re.search(r'\sId="([^"]+)"', tag)
+        target_m = _re.search(r'\sTarget="([^"]+)"', tag)
+        if id_m and target_m:
+            rel_map[id_m.group(1)] = target_m.group(1)
 
     target = rel_map[target_rid]
-    if target.startswith('/'):
-        target = target.lstrip('/')
-    else:
+    target = target.lstrip('/')
+    if not target.startswith('xl/'):
         target = 'xl/' + target
     return target
 
 
-def _xlsx_build_merge_map(sheet_root):
-    """Mapeia cada célula de um intervalo mesclado para a célula âncora (canto superior esquerdo)."""
+def _build_merge_map(sheet_xml):
     merge_map = {}
-    merge_cells_el = sheet_root.find(f'{{{_NS_MAIN}}}mergeCells')
-    if merge_cells_el is None:
-        return merge_map
-
-    for mc in merge_cells_el.findall(f'{{{_NS_MAIN}}}mergeCell'):
-        ref = mc.get('ref')
-        start, end = ref.split(':')
-        start_col, start_row = _xlsx_split_ref(start)
-        end_col, end_row = _xlsx_split_ref(end)
-        c1, c2 = _xlsx_col_to_num(start_col), _xlsx_col_to_num(end_col)
+    for m in re.finditer(r'<mergeCell\s+ref="([A-Z]+\d+):([A-Z]+\d+)"\s*/>', sheet_xml):
+        start, end = m.group(1), m.group(2)
+        start_col, start_row = _split_ref(start)
+        end_col, end_row = _split_ref(end)
+        c1, c2 = _col_to_num(start_col), _col_to_num(end_col)
         for r in range(start_row, end_row + 1):
             for c in range(min(c1, c2), max(c1, c2) + 1):
-                merge_map[f'{_xlsx_num_to_col(c)}{r}'] = start
+                col_letters = ''
+                n = c
+                while n > 0:
+                    n, rem = divmod(n - 1, 26)
+                    col_letters = chr(65 + rem) + col_letters
+                merge_map[f'{col_letters}{r}'] = start
     return merge_map
 
 
-def _xlsx_set_cell_value(sheet_root, cell_ref, value):
-    col_letters, row_num = _xlsx_split_ref(cell_ref)
-    sheet_data = sheet_root.find(f'{{{_NS_MAIN}}}sheetData')
+def _escape_xml_text(text):
+    return (
+        text.replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+    )
 
-    row_el = None
-    for r in sheet_data.findall(f'{{{_NS_MAIN}}}row'):
-        if int(r.get('r')) == row_num:
-            row_el = r
-            break
-    if row_el is None:
-        row_el = ET.SubElement(sheet_data, f'{{{_NS_MAIN}}}row')
-        row_el.set('r', str(row_num))
-        rows_sorted = sorted(sheet_data.findall(f'{{{_NS_MAIN}}}row'), key=lambda x: int(x.get('r')))
-        sheet_data[:] = rows_sorted
 
-    cell_el = None
-    for c in row_el.findall(f'{{{_NS_MAIN}}}c'):
-        if c.get('r') == cell_ref:
-            cell_el = c
-            break
-    if cell_el is None:
-        cell_el = ET.SubElement(row_el, f'{{{_NS_MAIN}}}c')
-        cell_el.set('r', cell_ref)
-        cells_sorted = sorted(
-            row_el.findall(f'{{{_NS_MAIN}}}c'),
-            key=lambda c: _xlsx_col_to_num(_xlsx_split_ref(c.get('r'))[0])
-        )
-        row_el[:] = cells_sorted
-
-    # limpa o valor/fórmula antigos, mas preserva o atributo de estilo "s" da célula
-    for child in list(cell_el):
-        cell_el.remove(child)
-
+def _build_cell_xml(cell_ref, style_attr, value):
     if isinstance(value, bool):
-        cell_el.set('t', 'b')
-        v_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}v')
-        v_el.text = '1' if value else '0'
-    elif isinstance(value, (int, float)):
-        cell_el.attrib.pop('t', None)
-        v_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}v')
-        v_el.text = repr(value) if isinstance(value, float) else str(value)
+        return f'<c r="{cell_ref}"{style_attr} t="b"><v>{"1" if value else "0"}</v></c>'
+    if isinstance(value, (int, float)):
+        v_text = repr(value) if isinstance(value, float) else str(value)
+        return f'<c r="{cell_ref}"{style_attr}><v>{v_text}</v></c>'
+    text = _escape_xml_text('' if value is None else str(value))
+    return f'<c r="{cell_ref}"{style_attr} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+_CELL_PATTERN_TMPL = r'<c r="{ref}"(?P<attrs>[^>]*?)(?:/>|>(?P<content>.*?)</c>)'
+
+
+def _extract_style_attr(attrs_str):
+    m = re.search(r'\ss="(\d+)"', attrs_str)
+    return f' s="{m.group(1)}"' if m else ''
+
+
+def _set_cell_in_row(row_xml, cell_ref, new_cell_xml):
+    """Substitui a célula se existir; caso contrário insere na posição correta dentro da linha."""
+    pattern = re.compile(_CELL_PATTERN_TMPL.format(ref=re.escape(cell_ref)), re.DOTALL)
+    match = pattern.search(row_xml)
+    if match:
+        return row_xml[:match.start()] + new_cell_xml + row_xml[match.end():]
+
+    # célula não existe nessa linha: insere na posição correta (ordem crescente de coluna)
+    target_col_num = _col_to_num(_split_ref(cell_ref)[0])
+    insert_pos = None
+    for m in re.finditer(r'<c r="([A-Z]+)\d+"[^>]*?(?:/>|>.*?</c>)', row_xml, re.DOTALL):
+        existing_col_num = _col_to_num(m.group(1))
+        if existing_col_num > target_col_num:
+            insert_pos = m.start()
+            break
+    if insert_pos is None:
+        # nenhuma célula com coluna maior: insere antes de </row>
+        close_idx = row_xml.rindex('</row>')
+        return row_xml[:close_idx] + new_cell_xml + row_xml[close_idx:]
+    return row_xml[:insert_pos] + new_cell_xml + row_xml[insert_pos:]
+
+
+def _set_cell_value(sheet_xml, cell_ref, value):
+    col_letters, row_num = _split_ref(cell_ref)
+
+    row_pattern = re.compile(
+        r'(<row r="' + str(row_num) + r'"[^>]*?)(/>|>(.*?)</row>)', re.DOTALL
+    )
+    match = row_pattern.search(sheet_xml)
+
+    if match:
+        row_open_attrs = match.group(1)
+        is_self_closing = match.group(2).startswith('/>')
+        row_content = '' if is_self_closing else (match.group(3) or '')
+
+        existing_style = ''
+        cell_match = re.search(
+            _CELL_PATTERN_TMPL.format(ref=re.escape(cell_ref)), row_content, re.DOTALL
+        )
+        if cell_match:
+            existing_style = _extract_style_attr(cell_match.group('attrs'))
+
+        new_cell_xml = _build_cell_xml(cell_ref, existing_style, value)
+        new_row_content = _set_cell_in_row(row_content, cell_ref, new_cell_xml)
+        new_row_xml = f'{row_open_attrs}>{new_row_content}</row>'
+
+        return sheet_xml[:match.start()] + new_row_xml + sheet_xml[match.end():]
+
+    # a linha inteira não existe: cria uma nova <row> na posição correta dentro de <sheetData>
+    new_cell_xml = _build_cell_xml(cell_ref, '', value)
+    new_row_xml = f'<row r="{row_num}">{new_cell_xml}</row>'
+
+    sheet_data_match = re.search(r'<sheetData>(.*?)</sheetData>', sheet_xml, re.DOTALL)
+    sheet_data_content = sheet_data_match.group(1)
+
+    insert_pos_in_data = None
+    for m in re.finditer(r'<row r="(\d+)"[^>]*?(?:/>|>.*?</row>)', sheet_data_content, re.DOTALL):
+        if int(m.group(1)) > row_num:
+            insert_pos_in_data = m.start()
+            break
+
+    if insert_pos_in_data is None:
+        new_sheet_data_content = sheet_data_content + new_row_xml
     else:
-        cell_el.set('t', 'inlineStr')
-        is_el = ET.SubElement(cell_el, f'{{{_NS_MAIN}}}is')
-        t_el = ET.SubElement(is_el, f'{{{_NS_MAIN}}}t')
-        t_el.text = '' if value is None else str(value)
-        t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        new_sheet_data_content = (
+            sheet_data_content[:insert_pos_in_data] + new_row_xml + sheet_data_content[insert_pos_in_data:]
+        )
+
+    start, end = sheet_data_match.span(1)
+    return sheet_xml[:start] + new_sheet_data_content + sheet_xml[end:]
 
 
 def _safe_date_time(date_time):
-    """Alguns geradores de xlsx (Excel/LibreOffice) gravam datas fora do
-    intervalo aceito pelo zipfile do Python (ano < 1980, mês/dia 0, etc.),
-    o que faz o zipfile lançar erro ao regravar a entrada. Normaliza aqui."""
     year, month, day, hour, minute, second = date_time
     year = max(year, 1980)
     month = min(max(month, 1), 12)
@@ -944,33 +980,33 @@ def _safe_date_time(date_time):
 
 def preencher_modelo_xlsx(modelo_path, valores, output_path):
     """
-    Preenche células de um .xlsx a partir de {celula: valor}, editando
-    apenas o XML da planilha ativa. Imagens, desenhos, estilos e gráficos
-    do modelo são copiados sem alteração — não passam pelo openpyxl.
+    Preenche células de um .xlsx a partir de {celula: valor} editando SOMENTE
+    o texto das tags <c> alvo dentro do XML da planilha ativa — nunca faz o
+    parse/reserialização da árvore inteira. Isso evita o problema clássico de
+    bibliotecas XML (incluindo ElementTree e openpyxl) trocarem prefixos de
+    namespace (mc:Ignorable, x14ac, xr, xr2, xr3) usados por arquivos gerados
+    pelo Excel de verdade, o que faz o Excel acusar "conteúdo com problema"
+    ao reabrir. Todo o resto do arquivo — incluindo o restante do próprio
+    XML da planilha, imagens, desenhos, estilos — permanece byte a byte
+    idêntico ao modelo original.
     """
     with zipfile.ZipFile(modelo_path, 'r') as zin:
-        sheet_path = _xlsx_find_active_sheet_path(zin)
-        sheet_root = ET.fromstring(zin.read(sheet_path))
+        sheet_path = _find_active_sheet_path(zin)
+        sheet_xml = zin.read(sheet_path).decode('utf-8')
 
-        merge_map = _xlsx_build_merge_map(sheet_root)
+        merge_map = _build_merge_map(sheet_xml)
 
         for cell_ref, value in valores.items():
             if value is None:
                 continue
             actual_ref = merge_map.get(cell_ref, cell_ref)
-            _xlsx_set_cell_value(sheet_root, actual_ref, value)
+            sheet_xml = _set_cell_value(sheet_xml, actual_ref, value)
 
-        new_sheet_bytes = ET.tostring(sheet_root, encoding='UTF-8', xml_declaration=True)
+        new_sheet_bytes = sheet_xml.encode('utf-8')
 
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 data = new_sheet_bytes if item.filename == sheet_path else zin.read(item.filename)
-
-                # Cria um ZipInfo NOVO em vez de reaproveitar o original.
-                # Reutilizar o ZipInfo de origem (com seus flag_bits, extras
-                # de zip64 e tamanhos/CRC antigos) é uma causa clássica de
-                # zip corrompido ao regravar em uma versão diferente do
-                # Python/zipfile (ex.: ambiente do Render x ambiente local).
                 fresh_info = zipfile.ZipInfo(
                     filename=item.filename,
                     date_time=_safe_date_time(item.date_time)
@@ -978,16 +1014,14 @@ def preencher_modelo_xlsx(modelo_path, valores, output_path):
                 fresh_info.compress_type = zipfile.ZIP_DEFLATED
                 fresh_info.external_attr = item.external_attr
                 fresh_info.create_system = item.create_system
-
                 zout.writestr(fresh_info, data)
 
-        # Verifica a integridade do arquivo antes de devolvê-lo — se algo
-        # ficou corrompido, falha aqui com um erro claro em vez de gerar
-        # um .xlsx quebrado que só vai ser percebido ao abrir no Excel.
         with zipfile.ZipFile(output_path, 'r') as check:
             bad_file = check.testzip()
             if bad_file is not None:
                 raise RuntimeError(f'Falha de integridade ao gerar o croqui (entrada corrompida: {bad_file})')
+
+
 
 
 # =========================================================
